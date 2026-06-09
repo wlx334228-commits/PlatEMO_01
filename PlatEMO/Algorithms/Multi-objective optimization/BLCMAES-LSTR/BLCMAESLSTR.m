@@ -31,12 +31,13 @@ classdef BLCMAESLSTR < ALGORITHM
             try
                 for iter = 1 : maxIter
                     gen = iter;
-                    if Problem.FE >= BI.UmaxFEs
+                    remainingUpperFE = BI.UmaxFEs - Problem.FE;
+                    if remainingUpperFE < 2
                         break;
                     end
 
                     %% Sampling and LSTR correction
-                    popN = min(CMA.lambda,BI.UmaxFEs-Problem.FE);
+                    popN = min(CMA.lambda,floor(remainingUpperFE/2));
                     sampledDec = zeros(popN,BI.dim);
                     ulBaseDec = zeros(popN,BI.u_dim);
                     for i = 1 : popN
@@ -45,13 +46,27 @@ classdef BLCMAESLSTR < ALGORITHM
                     end
                     ulDec = GenerateLSTROffspring(ulBaseDec,Archive,Problem,lstrParams);
 
+                    BasePOP = EmptyIndividual(popN);
                     POP = EmptyIndividual(popN);
                     for i = 1 : popN
+                        BasePOP(i).UX = ulBaseDec(i,:);
+                        BasePOP(i).LX = sampledDec(i,BI.u_dim+1:end);
                         POP(i).UX = ulDec(i,:);
                         POP(i).LX = sampledDec(i,BI.u_dim+1:end);
                     end
 
-                    %% Lower-level search and upper-level evaluation
+                    %% Probe base offspring without LSTR correction
+                    for i = 1 : popN
+                        [BasePOP(i).LX,BasePOP(i).LF,BasePOP(i).LC,BasePOP(i).RF,totalFElower] = ...
+                            LowerLevelSearch(Problem,BasePOP(i).UX,CMA,BI,totalFElower);
+                        [BasePOP(i).UF,BasePOP(i).UC,BasePOP(i).Solution] = ...
+                            EvaluateUpper(Problem,BasePOP(i).UX,BasePOP(i).LX,BI);
+                        BasePOP(i).UFEs = Problem.FE;
+                        BasePOP(i).LFEs = totalFElower;
+                    end
+                    BasePOP = AssignUpperFitness(BasePOP,BI);
+
+                    %% Evaluate LSTR-corrected offspring used by the algorithm
                     for i = 1 : popN
                         [POP(i).LX,POP(i).LF,POP(i).LC,POP(i).RF,totalFElower] = ...
                             LowerLevelSearch(Problem,POP(i).UX,CMA,BI,totalFElower);
@@ -62,6 +77,7 @@ classdef BLCMAESLSTR < ALGORITHM
                     end
 
                     POP = AssignUpperFitness(POP,BI);
+                    lstrStats = CalLSTRProbeStats(ulBaseDec,ulDec,BasePOP,POP);
 
                     %% Elite preservation and refinement
                     rfIdx = find([POP.RF]);
@@ -113,9 +129,13 @@ classdef BLCMAESLSTR < ALGORITHM
                     upperReached = targetBest || targetElite;
 
                     fprintf(['BLCMAESLSTR Gen=%4d | UpperFE=%6d | TotalLowerFE=%10d | ', ...
-                        'UpperFit=%.6e | LowerFit=%.6e | lowerGap=%.6e | RF=%d | Archive=%d | Sigma=%.3e\n'], ...
+                        'UpperFit=%.6e | LowerFit=%.6e | lowerGap=%.6e | RF=%d | ', ...
+                        'Archive=%d | Sigma=%.3e | LSTRBetter=%d/%d | LSTRRate=%.2f%% | ', ...
+                        'BaseBestFit=%.6e | LSTRBestFit=%.6e\n'], ...
                         iter,Problem.FE,totalFElower,elite.UF,lowerFit,lowerGap, ...
-                        elite.RF,size(Archive.X0,1),CMA.sigma);
+                        elite.RF,size(Archive.X0,1),CMA.sigma, ...
+                        lstrStats.Better,lstrStats.Trial,lstrStats.Rate*100, ...
+                        lstrStats.BaseBestFit,lstrStats.LSTRBestFit);
 
                     nofinish = Algorithm.NotTerminated(currentPopulation);
 
@@ -171,6 +191,24 @@ function POP = EmptyIndividual(N)
     indiv = struct('UX',[],'LX',[],'UF',[],'LF',[],'UC',0,'LC',0, ...
         'RF',false,'fit',[],'UFEs',[],'LFEs',[],'Solution',[]);
     POP = repmat(indiv,1,N);
+end
+
+function Stats = CalLSTRProbeStats(ulBaseDec,ulLSTRDec,BasePOP,LSTRPOP)
+    baseFit = [BasePOP.fit];
+    lstrFit = [LSTRPOP.fit];
+    perturbed = any(abs(ulLSTRDec-ulBaseDec) > 1e-12,2)';
+
+    Stats.Trial = sum(perturbed);
+    if Stats.Trial > 0
+        Stats.Better = sum(lstrFit(perturbed) < baseFit(perturbed));
+        Stats.Rate = Stats.Better / Stats.Trial;
+    else
+        Stats.Better = 0;
+        Stats.Rate = 0;
+    end
+
+    Stats.BaseBestFit = min(baseFit);
+    Stats.LSTRBestFit = min(lstrFit);
 end
 
 function U = SampleFullVector(CMA,BI)
